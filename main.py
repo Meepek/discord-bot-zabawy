@@ -18,7 +18,7 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 DATABASE_URL = os.getenv('DATABASE_URL')
-LOG_CHANNEL_ID = 123456789012345678 # <<<================ ZASTĄP PRAWDZIWYM ID KANAŁU LOGÓW
+LOG_CHANNEL_ID = 1396830903807774751 # <<<================ ZASTĄP PRAWDZIWYM ID KANAŁU LOGÓW
 
 if not all([DISCORD_TOKEN, GOOGLE_API_KEY, DATABASE_URL]):
     print("BŁĄD: Brak kluczowych zmiennych środowiskowych (TOKEN, API_KEY, DATABASE_URL).")
