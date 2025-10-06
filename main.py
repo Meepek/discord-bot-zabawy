@@ -140,18 +140,34 @@ async def check_and_grant_achievements(user, channel, **kwargs):
     if user_stats['story_posts'] >= 5 and grant_achievement(user.id, "SCRIBE"): await announce_achievement("SCRIBE")
 
 async def generate_from_ai(prompt, is_json=False, temp=0.9):
-    safety_settings = {cat: HarmBlockThreshold.BLOCK_NONE for cat in HarmCategory}
+    # POPRAWNA, JAWNA DEFINICJA USTAWIEŃ BEZPIECZEŃSTWA
+    safety_settings = [
+        {"category": HarmCategory.HARM_CATEGORY_HARASSMENT, "threshold": HarmBlockThreshold.BLOCK_NONE},
+        {"category": HarmCategory.HARM_CATEGORY_HATE_SPEECH, "threshold": HarmBlockThreshold.BLOCK_NONE},
+        {"category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, "threshold": HarmBlockThreshold.BLOCK_NONE},
+        {"category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, "threshold": HarmBlockThreshold.BLOCK_NONE},
+    ]
+
     try:
-        response = await model.generate_content_async(prompt, generation_config=genai.GenerationConfig(temperature=temp), safety_settings=safety_settings)
+        response = await model.generate_content_async(
+            prompt,
+            generation_config=genai.GenerationConfig(temperature=temp),
+            safety_settings=safety_settings  # Używamy teraz poprawnej listy
+        )
         text = response.text.strip()
-        if is_json: return json.loads(re.sub(r'```json\s*|\s*```', '', text, flags=re.DOTALL))
+        if is_json:
+            return json.loads(re.sub(r'```json\s*|\s*```', '', text, flags=re.DOTALL))
         return text
     except google.api_core.exceptions.ResourceExhausted:
-        await post_log("WARNING", "Przekroczono limit API Google", description="Zbyt wiele zapytań. Czekam 60 sekund."); print("Przekroczono limit API, czekam 60s...")
-        await asyncio.sleep(60); return await generate_from_ai(prompt, is_json, temp)
+        await post_log("WARNING", "Przekroczono limit API Google", description="Zbyt wiele zapytań. Czekam 60 sekund.")
+        print("Przekroczono limit API, czekam 60s...")
+        await asyncio.sleep(60)
+        return await generate_from_ai(prompt, is_json, temp)
     except Exception as e:
-        if "response.candidates' is empty" in str(e): await post_log("WARNING", "Odpowiedź AI zablokowana", description="Filtry bezpieczeństwa Google zablokowały odpowiedź.", fields={"Prompt": f"```{prompt[:1000]}...```"})
-        else: await post_log("ERROR", "Błąd API Google AI", description=f"```\n{e}\n```")
+        if "response.candidates' is empty" in str(e):
+            await post_log("WARNING", "Odpowiedź AI zablokowana", description="Filtry bezpieczeństwa Google zablokowały odpowiedź.", fields={"Prompt": f"```{prompt[:1000]}...```"})
+        else:
+            await post_log("ERROR", "Błąd API Google AI", description=f"```\n{e}\n```")
         return None
 
 async def generate_word(length, difficulty):
