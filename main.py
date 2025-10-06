@@ -157,7 +157,7 @@ async def set_channels_lock(lock_status, guild, interaction):
             try: await ch.set_permissions(guild.default_role, overwrite=perms)
             except discord.Forbidden: await post_log("ERROR", "Błąd Blokady", description=f"Brak uprawnień do zarządzania {ch.mention}.")
 
-            def check_wordle_guess(guess, secret):
+def check_wordle_guess(guess, secret):
     fb, s_letters, g_letters = ['⬛']*len(secret), list(secret), list(guess)
     for i in range(len(secret)):
         if g_letters[i] == s_letters[i]: fb[i], s_letters[i], g_letters[i] = '🟩', None, None
