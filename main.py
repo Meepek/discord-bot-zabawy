@@ -30,7 +30,7 @@ model = genai.GenerativeModel('gemini-pro-latest')
 intents = discord.Intents.default(); intents.message_content, intents.members = True, True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-player_games, channel_wide_games = {}, {}
+player_games, channel_wide_games, recently_used_words = {}, {}, set()
 IDLE_TIMEOUT = 90
 POINTS = {"łatwy": 10, "normalny": 15, "trudny": 25}
 ACHIEVEMENTS = {
@@ -51,8 +51,9 @@ def setup_database():
             cur.execute("""CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, user_name TEXT, score INT DEFAULT 0, quiz_wins INT DEFAULT 0, wordle_wins INT DEFAULT 0, story_posts INT DEFAULT 0)""")
             cur.execute("""CREATE TABLE IF NOT EXISTS achievements (user_id BIGINT, achievement_id TEXT, PRIMARY KEY (user_id, achievement_id))""")
             cur.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS used_questions (question_hash TEXT PRIMARY KEY)""")
             cur.execute("INSERT INTO settings (key, value) VALUES ('maintenance_mode', 'false') ON CONFLICT (key) DO NOTHING")
-        conn.commit(); print("Baza danych gotowa.")
+        conn.commit(); print("Baza danych PostgreSQL gotowa.")
 
 def update_user_score(user_id, user_name, points=0, **kwargs):
     with get_db_connection() as conn:
@@ -66,11 +67,20 @@ def update_user_score(user_id, user_name, points=0, **kwargs):
             params.append(user_id); cur.execute(query, tuple(params))
         conn.commit()
 
+def add_used_question(question_text):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur: cur.execute("INSERT INTO used_questions (question_hash) VALUES (%s) ON CONFLICT (question_hash) DO NOTHING", (str(hash(question_text)),)); conn.commit()
+
+def get_recent_question_hashes(limit=50):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur: cur.execute("SELECT question_hash FROM used_questions ORDER BY random() LIMIT %s", (limit,)); return [row[0] for row in cur.fetchall()]
+
 def grant_achievement(user_id, ach_id):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM achievements WHERE user_id = %s AND achievement_id = %s", (user_id, ach_id))
-            if cur.fetchone() is None: cur.execute("INSERT INTO achievements (user_id, achievement_id) VALUES (%s, %s)", (user_id, ach_id)); conn.commit(); return True
+            if cur.fetchone() is None:
+                cur.execute("INSERT INTO achievements (user_id, achievement_id) VALUES (%s, %s)", (user_id, ach_id)); conn.commit(); return True
     return False
 
 def get_user_stats(uid):
@@ -95,12 +105,10 @@ def set_setting(key, value):
     with get_db_connection() as conn:
         with conn.cursor() as cur: cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, str(value))); conn.commit()
 
-# --- FUNKCJE POMOCNICZE I AI ---
 async def post_log(level, title, description="", fields=None, ctx=None):
     if LOG_CHANNEL_ID == 123456789012345678: return
     log_channel = bot.get_channel(LOG_CHANNEL_ID)
-    if not log_channel: return
-
+    if not log_channel: print(f"BŁĄD: Nie mogę znaleźć kanału logów {LOG_CHANNEL_ID}."); return
     emojis = {"INFO": "ℹ️", "SUCCESS": "✅", "FAIL": "❌", "ERROR": "🚨", "WARNING": "⚠️"}
     colors = {"INFO": 0x3498db, "SUCCESS": 0x2ecc71, "FAIL": 0xe67e22, "ERROR": 0xe74c3c, "WARNING": 0xf1c40f}
     embed = discord.Embed(title=f"{emojis.get(level, '❓')} {title}", description=description, color=colors.get(level, 0x99aab5), timestamp=discord.utils.utcnow())
@@ -129,6 +137,7 @@ async def check_and_grant_achievements(user, channel, **kwargs):
     if kwargs.get('taboo_win') and grant_achievement(user.id, "SOCIALITE"): await announce("SOCIALITE")
     if stats['story_posts'] >= 5 and grant_achievement(user.id, "SCRIBE"): await announce("SCRIBE")
 
+    # --- FUNKCJE GENERUJĄCE AI ---
 async def generate_from_ai(prompt, is_json=False, temp=0.9):
     safety_settings = [
         {"category": HarmCategory.HARM_CATEGORY_HARASSMENT, "threshold": HarmBlockThreshold.BLOCK_NONE},
@@ -149,6 +158,35 @@ async def generate_from_ai(prompt, is_json=False, temp=0.9):
         else: await post_log("ERROR", "Błąd API Google AI", description=f"```\n{e}\n```")
         return None
 
+async def generate_word(length, difficulty, exclude_words=None):
+    diff_prompt = {"łatwy": "popularne", "normalny": "powszechne", "trudny": "rzadkie"}
+    exclusion_prompt = f"Nie może to być żadne z tych słów: {', '.join(exclude_words)}." if exclude_words else ""
+    prompt = f"Jesteś pomocnikiem w grze słownej. Podaj jedno, {diff_prompt[difficulty]} polskie słowo (rzeczownik), {length} liter, bez polskich znaków. {exclusion_prompt} ODPOWIEDZ TYLKO SAMYM SŁOWEM."
+    word = await generate_from_ai(prompt, temp=1.0)
+    if word and len(word) == length and re.match(f"^[A-Z]{{{length}}}$", word) and (not exclude_words or word not in exclude_words): return word
+    else: return await generate_word(length, difficulty, exclude_words)
+
+async def generate_quiz_question(category, difficulty, exclude_hashes=None):
+    exclusion_prompt = f"Unikaj pytań o podobnej tematyce do tych (reprezentowanych przez hashe): {', '.join(map(str, exclude_hashes))}." if exclude_hashes else ""
+    prompt = f'Jesteś kreatywnym twórcą quizów. Stwórz jedno {difficulty} pytanie z kategorii "{category}". Bądź naturalny i pomysłowy. Odpowiedź nie może być zawarta w pytaniu. {exclusion_prompt} Losowo przypisz poprawną odpowiedź. JSON: {{"question": "...", "answers": {{"A": "...", "B": "...", "C": "...", "D": "..."}}, "correct_answer": "A"}}'
+    q_data = await generate_from_ai(prompt, is_json=True)
+    if q_data and str(hash(q_data.get('question', ''))) not in (exclude_hashes or []):
+        add_used_question(q_data.get('question'))
+        return q_data
+    else: return await generate_quiz_question(category, difficulty, exclude_hashes)
+
+async def answer_yes_no(question, secret_object, history):
+    hist_text = "\n".join([f"Gracz: {h['q']} | Ty: {h['a']}" for h in history])
+    prompt = f'Grasz w 20 pytań. Jesteś osobą, która wymyśliła hasło. Twoje hasło to: "{secret_object}". Odpowiadaj naturalnie i po ludzku. Historia:\n{hist_text}\n\nNowe pytanie: "{question}"\n\nOdpowiedz krótko, używając wariacji TAK/NIE, np. "Zgadza się", "Pudło", "Nie do końca".'
+    return await generate_from_ai(prompt)
+
+async def validate_association_ai(last_word, new_word):
+    prompt = f'Czy słowo "{new_word}" jest rozsądnym skojarzeniem do słowa "{last_word}"? Dopuszczaj luźne powiązania. Odpowiedz tylko "TAK" lub "NIE".'
+    return await generate_from_ai(prompt)
+
+async def generate_hint(secret_object):
+    return await generate_from_ai(f'Podaj krótką podpowiedź o "{secret_object}", nie zdradzając go.')
+
 async def set_channels_lock(lock_status, guild, interaction):
     cids = get_allowed_channels() or [interaction.channel_id]
     perms = discord.PermissionOverwrite(send_messages=not lock_status)
@@ -164,10 +202,14 @@ def check_wordle_guess(guess, secret):
     for i in range(len(secret)):
         if g_letters[i] and g_letters[i] in s_letters: fb[i] = '🟨'; s_letters[s_letters.index(g_letters[i])] = None
     return "".join(fb)
+
 def display_hangman(game):
     art = ["  +---+\n  |   |\n      |\n      |\n      |\n      |\n===", "  +---+\n  |   |\n  O   |\n      |\n      |\n      |\n===", "  +---+\n  |   |\n  O   |\n  |   |\n      |\n      |\n===", "  +---+\n  |   |\n  O   |\n /|   |\n      |\n      |\n===", "  +---+\n  |   |\n  O   |\n /|\\  |\n      |\n      |\n===", "  +---+\n  |   |\n  O   |\n /|\\  |\n /    |\n      |\n===", "  +---+\n  |   |\n  O   |\n /|\\  |\n / \\  |\n      |\n==="]
     word = " ".join([l if l in game['guessed_letters'] else "_" for l in game['word']])
-    return f"```\n{art[min(game['wrong_guesses'], 6)]}\n```\n**Słowo:** `{word}`\n**Użyte:** {', '.join(sorted(game.get('guessed_letters', [])))}\n**Błędy:** {game['wrong_guesses']}/{game['max_wrong_guesses']}"
+    msg = f"```\n{art[min(game['wrong_guesses'], 6)]}\n```\n**Słowo:** `{word}`\n"
+    if game.get('guessed_letters'): msg += f"**Użyte:** {', '.join(sorted(game.get('guessed_letters', [])))}\n"
+    msg += f"**Błędy:** {game['wrong_guesses']}/{game['max_wrong_guesses']}"
+    return msg
 
 class ConfirmResetView(ui.View):
     def __init__(self, author_id): super().__init__(timeout=60); self.author_id, self.confirmed = author_id, None
@@ -175,12 +217,12 @@ class ConfirmResetView(ui.View):
         if i.user.id != self.author_id: await i.response.send_message("Tylko inicjator.", ephemeral=True); return False
         return True
     @ui.button(label="Tak, zresetuj!", style=discord.ButtonStyle.danger)
-    async def confirm(self, i, b):
+    async def confirm(self, i: discord.Interaction, b: ui.Button):
         self.confirmed=True
         for item in self.children: item.disabled = True
         await i.response.edit_message(content="✅ **Resetuję...**", view=self); self.stop()
     @ui.button(label="Anuluj", style=discord.ButtonStyle.secondary)
-    async def cancel(self, i, b):
+    async def cancel(self, i: discord.Interaction, b: ui.Button):
         self.confirmed=False
         for item in self.children: item.disabled = True
         await i.response.edit_message(content="👍 **Anulowano.**", view=self); self.stop()
@@ -189,7 +231,7 @@ class TruthLieView(ui.View):
     def __init__(self, lie_index, game_key): super().__init__(timeout=180); self.lie_index, self.game_key, self.clicked = lie_index, game_key, False
     async def on_timeout(self):
         if self.game_key in player_games and not self.clicked: del player_games[self.game_key]
-    async def check_answer(self, i, choice_index):
+    async def check_answer(self, i: discord.Interaction, choice_index: int):
         self.clicked=True
         for item in self.children: item.disabled = True
         if choice_index == self.lie_index:
@@ -218,18 +260,22 @@ async def check_idle_games():
                 async with ch.typing(): sentence = await generate_from_ai(f"Dokończ historię: \"{' '.join(game['full_story'])}\"")
                 if sentence: await ch.send(f"*{bot.user.name} dopisuje:*\n> {sentence}"); game.update({'last_player_id': bot.user.id, 'last_activity': time.time()}); game['full_story'].append(sentence)
 
-# --- HANDLERY WIADOMOŚCI ---
+                # --- HANDLERY WIADOMOŚCI ---
 async def handle_wordle_guess(msg, game, key):
     guess = msg.content.upper().strip()
     if len(guess) != len(game['word']) or not guess.isalpha(): return
     game['attempts'] += 1; game.setdefault('history', []).append(guess); await msg.reply(f"{check_wordle_guess(guess, game['word'])} `({game['attempts']}/{game['max_attempts']})`", mention_author=False)
     if guess == game['word']:
         points = POINTS[game['difficulty']] + (len(game['word']) - 4) * 5
-        await msg.channel.send(f"🎉 Brawo! Słowo: **{game['word']}**! (+{points} pkt)"); update_user_score(msg.author.id, msg.author.name, points=points, wordle_win=True)
-        await post_log("SUCCESS", "Wordle (Wygrana)", fields={"Słowo": game['word'], "Próby": f"{game['attempts']}/{game['max_attempts']}", "Punkty": points}, ctx=msg)
-        await check_and_grant_achievements(msg.author, msg.channel, wordle_attempts=game['attempts']); del player_games[key]
+        await msg.channel.send(f"🎉 Zgadza się, {msg.author.mention}! Słowo to **{game['word']}**! Zdobywasz **{points} punktów**."); update_user_score(msg.author.id, msg.author.name, points=points, wordle_win=True);
+        recently_used_words.add(game['word'])
+        await post_log("SUCCESS", "Wordle (Wygrana)", fields={"Słowo": game['word'], "Próby": f"{game['attempts']}/{game['max_attempts']}", "Punkty": points}, ctx=msg);
+        await check_and_grant_achievements(msg.author, msg.channel, wordle_attempts=game['attempts'])
+        del player_games[key]
     elif game['attempts'] >= game['max_attempts']:
-        await msg.channel.send(f"😔 Niestety. Słowo: **{game['word']}**."); await post_log("FAIL", "Wordle (Przegrana)", fields={"Słowo": game['word']}, ctx=msg); del player_games[key]
+        await msg.channel.send(f"😔 Tym razem się nie udało, {msg.author.mention}. Słowo to **{game['word']}**."); recently_used_words.add(game['word'])
+        await post_log("FAIL", "Wordle (Przegrana)", fields={"Słowo": game['word']}, ctx=msg); del player_games[key]
+
 async def handle_hangman_guess(msg, game, key):
     guess = msg.content.upper().strip()
     if not guess.isalpha() or len(guess) != 1 or guess in game.get('guessed_letters', []): return
@@ -237,41 +283,51 @@ async def handle_hangman_guess(msg, game, key):
     if guess not in game['word']: game['wrong_guesses'] += 1
     await msg.reply(display_hangman(game), mention_author=False)
     if all(l in game['guessed_letters'] for l in game['word']):
-        points = POINTS[game['difficulty']]; await msg.channel.send(f"🎉 Gratulacje! Hasło: **{game['word']}** (+{points} pkt)")
-        update_user_score(msg.author.id, msg.author.name, points=points, hangman_win=True)
+        points = POINTS[game['difficulty']]; await msg.channel.send(f"🎉 Gratulacje {msg.author.mention}! Hasło: **{game['word']}** (+{points} pkt)")
+        update_user_score(msg.author.id, msg.author.name, points=points, hangman_win=True); recently_used_words.add(game['word'])
         await post_log("SUCCESS", "Wisielec (Wygrana)", fields={"Hasło": game['word'], "Błędy": f"{game['wrong_guesses']}/{game['max_wrong_guesses']}", "Punkty": points}, ctx=msg)
         await check_and_grant_achievements(msg.author, msg.channel); del player_games[key]
     elif game['wrong_guesses'] >= game['max_wrong_guesses']:
-        await msg.channel.send(f"😔 Koniec gry. Hasło: **{game['word']}**."); await post_log("FAIL", "Wisielec (Przegrana)", fields={"Hasło": game['word']}, ctx=msg); del player_games[key]
+        await msg.channel.send(f"😔 Koniec gry. Hasło: **{game['word']}**."); recently_used_words.add(game['word'])
+        await post_log("FAIL", "Wisielec (Przegrana)", fields={"Hasło": game['word']}, ctx=msg); del player_games[key]
+
 async def handle_quiz_answer(msg, game, key):
     guess = msg.content.strip().upper()
     if guess not in ["A", "B", "C", "D"] or game.get('answered'): return
     game['answered'] = True; correct_key = game['question_data']['correct_answer']; points = POINTS[game['difficulty']]
     if guess == correct_key:
-        await msg.reply(f"✅ Poprawna odpowiedź! (+{points} pkt)", mention_author=False); update_user_score(msg.author.id, msg.author.name, points=points, quiz_win=True)
+        await msg.reply(f"✅ Zgadza się! Brawo! (+{points} pkt)", mention_author=False); update_user_score(msg.author.id, msg.author.name, points=points, quiz_win=True)
         await post_log("SUCCESS", "Quiz (Wygrana)", fields={"Kategoria": game.get('category', 'N/A'), "Punkty": points}, ctx=msg)
         await check_and_grant_achievements(msg.author, msg.channel)
     else:
-        correct_text = game['question_data']['answers'][correct_key]; await msg.reply(f"❌ Zła odpowiedź. Poprawna: **{correct_key}: {correct_text}**.", mention_author=False)
+        correct_text = game['question_data']['answers'][correct_key]; await msg.reply(f"❌ Pudło. Poprawna odpowiedź to **{correct_key}: {correct_text}**.", mention_author=False)
         await post_log("FAIL", "Quiz (Przegrana)", fields={"Kategoria": game.get('category', 'N/A'), "Odpowiedź": guess, "Poprawna": correct_key}, ctx=msg)
     del player_games[key]
+
 async def handle_20q_question(msg, game, key):
     if game['questions_asked'] >= 20: await msg.reply(f"⌛ Koniec pytań! Odpowiedź: **{game['secret_object']}**.", mention_author=False); await post_log("FAIL", "Zgadnij Co (Przegrana)", {"Obiekt": game['secret_object'], "Powód": "Limit pytań"}, ctx=msg); del player_games[key]; return
     question, game['questions_asked'] = msg.content, game['questions_asked'] + 1
     async with msg.channel.typing(): answer = await answer_yes_no(question, game['secret_object'], game.get('history',[]))
     if answer: await msg.reply(f"`Pyt. {game['questions_asked']}/20`: **{answer}**", mention_author=False); game.setdefault('history', []).append({'q': question, 'a': answer})
-    else: await msg.reply("Coś poszło nie tak...", mention_author=False); game['questions_asked'] -= 1
+    else: await msg.reply("Hmm, coś mi się zacięło. Zadaj inne pytanie.", mention_author=False); game['questions_asked'] -= 1
+
 async def handle_association(msg, game):
     if msg.author.id == game.get('last_player_id'): return
     new_word = msg.content.strip().upper().split()[0]
     if not new_word.isalpha() or new_word in game.get('word_history',[]): return
-    await msg.reply(f"**{game['last_word']}** → **{new_word}**. OK!", mention_author=False); game.update({'last_word': new_word, 'last_player_id': msg.author.id, 'last_activity': time.time()})
+    async with msg.channel.typing(): is_valid = await validate_association_ai(game['last_word'], new_word)
+    if is_valid and "TAK" in is_valid.upper():
+        await msg.reply(f"**{game['last_word']}** → **{new_word}**. Pasuje! Kto następny?", mention_author=False)
+        game.update({'last_word': new_word, 'last_player_id': msg.author.id, 'last_activity': time.time()})
+    else: await msg.reply(f"Hmm, {msg.author.mention}, nie jestem pewien, czy to dobre skojarzenie. Spróbuj czegoś innego!", mention_author=False)
+
 async def handle_story_addition(msg, game):
     if msg.author.id == game.get('last_player_id'): return
     sentence = msg.content.strip()
     if not sentence: return
     game.update({'last_player_id': msg.author.id, 'last_activity': time.time()}); game.setdefault('full_story',[]).append(sentence)
     update_user_score(msg.author.id, msg.author.name, story_post=True); await check_and_grant_achievements(msg.author, msg.channel); await msg.add_reaction('✅')
+
 async def handle_taboo_message(msg, game):
     content_upper = msg.content.upper()
     if msg.author.id == game.get('describing_player_id'):
@@ -286,7 +342,6 @@ async def handle_taboo_message(msg, game):
             update_user_score(describer.id, describer.name, points=15); await check_and_grant_achievements(describer, msg.channel, taboo_win=True)
             await post_log("SUCCESS", "Tabu (Wygrana)", {"Hasło": game.get('keyword'), "Zgadujący": f"{guesser.mention}", "Opisujący": f"{describer.mention}"}, msg); del channel_wide_games[msg.channel.id]
 
-# --- EVENTY BOTA, CHECKI I GŁÓWNE KOMENDY ---
 @bot.event
 async def on_ready():
     print(f'Zalogowano jako {bot.user}'); setup_database(); check_idle_games.start()
@@ -317,7 +372,7 @@ async def on_app_command_error(i: discord.Interaction, error: app_commands.AppCo
         if not i.response.is_done(): await i.response.send_message("Ups! Coś poszło nie tak.", ephemeral=True)
         else: await i.followup.send("Ups! Coś poszło nie tak.", ephemeral=True)
     except discord.errors.InteractionResponded:
-        await i.followup.send("Ups! Coś poszło nie tak (i wystąpił kolejny błąd przy jego obsłudze).", ephemeral=True)
+        await i.followup.send("Ups! Wystąpił błąd krytyczny.", ephemeral=True)
 
 async def is_bot_owner(i: discord.Interaction) -> bool: app_info = await i.client.application_info(); return i.user.id == app_info.owner.id
 def is_admin(): return app_commands.check(lambda i: i.user.guild_permissions.administrator)
@@ -340,7 +395,7 @@ async def info(i: discord.Interaction):
     embed.add_field(name="👤 Gry Osobiste", value="`/wordle`, `/wisielec`, `/quiz`, `/dwie_prawdy`, `/zgadnij_co`", inline=False)
     embed.add_field(name="👥 Gry Grupowe", value="`/skojarzenia`, `/historia`, `/tabu`, `/scenariusz`", inline=False)
     embed.add_field(name="🛠️ Komendy", value="`/ranking`, `/profil`, `/osiagniecia`, `/podpowiedz`, `/koniec`, `/koniec_kanal` (admin)", inline=False)
-    embed.set_footer(text=f"Wersja bota: 4.1"); await i.response.send_message(embed=embed)
+    embed.set_footer(text=f"Wersja bota: 4.2"); await i.response.send_message(embed=embed)
 
 @bot.tree.command(name="wordle", description="Rozpocznij osobistą grę w Wordle.")
 @app_commands.describe(długość="Dł. słowa (4-8)", trudność="Poziom trudności")
@@ -370,7 +425,7 @@ async def hangman(i: discord.Interaction, trudność: str = "normalny"):
 async def quiz(i: discord.Interaction, kategoria: str, trudność: str = "normalny"):
     if not await check_channel_and_game(i, True): return
     await i.response.send_message(f"🤖 Myślę nad pytaniem...", ephemeral=True)
-    used_hashes = get_recent_questions()
+    used_hashes = get_recent_question_hashes()
     data = await generate_quiz_question(kategoria, trudność, exclude_hashes=used_hashes)
     if not data: return await i.followup.send("Nie udało się wygenerować pytania.", ephemeral=True)
     player_games[(i.channel.id, i.user.id)] = {'game_type': 'quiz', 'question_data': data, 'answered': False, 'difficulty': trudność, 'category': kategoria}
@@ -383,7 +438,7 @@ async def quiz(i: discord.Interaction, kategoria: str, trudność: str = "normal
 async def two_truths(i: discord.Interaction):
     if not await check_channel_and_game(i, True): return
     await i.response.send_message("🤖 Myślę nad historiami...", ephemeral=True)
-    data = await generate_from_ai('Stwórz 3 stwierdzenia o sobie (jako AI): 2 prawdziwe, 1 kłamstwo. JSON: {"statements": ["...", "..."], "lie_index": 1}', is_json=True)
+    data = await generate_from_ai('Stwórz 3 stwierdzenia o sobie (AI): 2 prawdziwe, 1 kłamstwo. JSON: {"statements": ["...", "..."], "lie_index": 1}', is_json=True)
     if not data: return await i.followup.send("Błąd AI.", ephemeral=True)
     key = (i.channel.id, i.user.id); player_games[key] = {'game_type': 'two_truths'}
     desc = f"Zgadnij fałsz!\n\n1. {data['statements'][0]}\n2. {data['statements'][1]}\n3. {data['statements'][2]}"
@@ -425,7 +480,7 @@ async def taboo(i: discord.Interaction, gracz: discord.Member):
     if gracz.bot: return await i.response.send_message("Nie możesz wyznaczyć bota!", ephemeral=True)
     await i.response.send_message(f"🤖 Generuję kartę dla {gracz.mention}..."); card = await generate_from_ai('Stwórz kartę Tabu: słowo kluczowe i 5 zakazanych. JSON: {"keyword": "PSZCZOŁA", "taboo_words": ["MIÓD", "UL"]}', is_json=True)
     if not card: return await i.edit_original_response(content="Błąd AI.")
-    channel_wide_games[i.channel.id] = {'game_type': 'taboo', 'keyword': card['keyword'], 'taboo_words': card['taboo_words'], 'describing_player_id': gracz.id}
+    channel_wide_games[i.channel.id] = {'game_type': 'tabu', 'keyword': card['keyword'], 'taboo_words': card['taboo_words'], 'describing_player_id': gracz.id}
     try:
         embed = discord.Embed(title="🤫 Twoja Karta Tabu", description=f"Opiisz: **{card['keyword']}**.", color=discord.Color.orange())
         embed.add_field(name="Zakazane:", value="- " + "\n- ".join(card['taboo_words'])); await gracz.send(embed=embed)
