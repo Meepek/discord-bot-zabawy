@@ -154,7 +154,7 @@ async def generate_from_ai(prompt, is_json=False, temp=0.9):
         else: await post_log("ERROR", "Błąd API Google AI", description=f"```\n{e}\n```")
         return None
 
-  async def generate_word(length, difficulty):
+async def generate_word(length, difficulty):
     diff_prompt = {"łatwy": "popularne", "normalny": "powszechne", "trudny": "rzadkie"}
     prompt = f"Podaj jedno, {diff_prompt[difficulty]} polskie słowo (rzeczownik), {length} liter, bez polskich znaków. TYLKO SŁOWO."
     word = await generate_from_ai(prompt, temp=1.0)
